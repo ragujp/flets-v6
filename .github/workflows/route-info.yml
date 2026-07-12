@@ -1,0 +1,76 @@
+name: FLET'S v6 route-info check
+
+on:
+  schedule:
+    # 毎日 09:07 JST (00:07 UTC) に実行
+    - cron: '7 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: route-info-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Fetch route-info via home server
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          # 認証は Tailscale SSH(ACL の ssh ルール)に任せるため鍵は不要
+          ssh -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=15 \
+              "$SSH_USER@$SSH_HOST" \
+              "curl -6 -sS -H 'Connection: close' -A '' --connect-timeout 10 --max-time 30 'http://route-info.flets-east.jp:49881/v6/route-info'" \
+            | tr -d '\r' > /tmp/route-info-raw.txt
+          # 経路行が1行もなければ取得失敗として扱う
+          grep -Eq '^[0-9]{4},' /tmp/route-info-raw.txt
+
+      - name: Compare and notify Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: bash scripts/compare_and_notify.sh /tmp/route-info-raw.txt state/route-info.txt
+
+      - name: Commit updated state
+        run: |
+          if [ -z "$(git status --porcelain -- state/)" ]; then
+            echo "state に変更なし"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          git commit -m "Update route-info state ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push
+
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          jq -n --arg url "$RUN_URL" '{
+            username: "flets-v6 route-info",
+            embeds: [{
+              title: "⚠️ route-info チェックが失敗しました",
+              description: ("ワークフローの実行に失敗しました。ログを確認してください。\n" + $url),
+              color: 15158332,
+              timestamp: (now | todate)
+            }]
+          }' | curl -fsS -X POST -H 'Content-Type: application/json' -d @- "$DISCORD_WEBHOOK_URL"
